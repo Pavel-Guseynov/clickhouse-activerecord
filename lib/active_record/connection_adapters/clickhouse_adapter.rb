@@ -6,6 +6,8 @@ require 'clickhouse-activerecord/migration'
 require 'active_record/connection_adapters/clickhouse/oid/date'
 require 'active_record/connection_adapters/clickhouse/oid/date_time'
 require 'active_record/connection_adapters/clickhouse/oid/big_integer'
+require 'active_record/connection_adapters/clickhouse/oid/uuid'
+require 'active_record/connection_adapters/clickhouse/oid/enum'
 require 'active_record/connection_adapters/clickhouse/schema_definitions'
 require 'active_record/connection_adapters/clickhouse/schema_creation'
 require 'active_record/connection_adapters/clickhouse/schema_statements'
@@ -178,6 +180,8 @@ module ActiveRecord
         register_class_with_limit m, %r(String), Type::String
         register_class_with_limit m, 'Date',  Clickhouse::OID::Date
         register_class_with_limit m, 'DateTime',  Clickhouse::OID::DateTime
+        register_class_with_limit m, 'UUID', Clickhouse::OID::Uuid
+        register_class_with_limit m, %r(Enum), Clickhouse::OID::Enum
 
         register_class_with_limit m, %r(Int8), Type::Integer
         register_class_with_limit m, %r(Int16), Type::Integer
