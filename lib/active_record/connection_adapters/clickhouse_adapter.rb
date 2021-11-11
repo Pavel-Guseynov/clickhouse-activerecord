@@ -3,6 +3,7 @@
 require 'clickhouse-activerecord/arel/visitors/to_sql'
 require 'clickhouse-activerecord/arel/table'
 require 'clickhouse-activerecord/migration'
+require 'active_record/connection_adapters/clickhouse/oid/array'
 require 'active_record/connection_adapters/clickhouse/oid/date'
 require 'active_record/connection_adapters/clickhouse/oid/date_time'
 require 'active_record/connection_adapters/clickhouse/oid/big_integer'
@@ -19,6 +20,7 @@ module ActiveRecord
       # Establishes a connection to the database that's used by all Active Record objects
       def clickhouse_connection(config)
         config = config.symbolize_keys
+
         if config[:connection]
           connection = {
             connection: config[:connection]
@@ -29,6 +31,9 @@ module ActiveRecord
             host: config[:host] || 'localhost',
             port: port,
             ssl: config[:ssl].present? ? config[:ssl] : port == 443,
+            sslca: config[:sslca],
+            read_timeout: config[:read_timeout],
+            write_timeout: config[:write_timeout],
           }
         end
 
@@ -61,7 +66,11 @@ module ActiveRecord
   module TypeCaster
     class Map
       def is_view
-        types.is_view
+        if @klass.respond_to?(:is_view)
+          @klass.is_view # rails 6.1
+        else
+          types.is_view # less than 6.1
+        end
       end
     end
   end
@@ -190,12 +199,16 @@ module ActiveRecord
         register_class_with_limit m, %r(Int128), Type::Integer
         register_class_with_limit m, %r(Int256), Type::Integer
 
-        register_class_with_limit m, %r(Uint8), Type::UnsignedInteger
+        register_class_with_limit m, %r(UInt8), Type::UnsignedInteger
         register_class_with_limit m, %r(UInt16), Type::UnsignedInteger
         register_class_with_limit m, %r(UInt32), Type::UnsignedInteger
         register_class_with_limit m, %r(UInt64), Type::UnsignedInteger
         #register_class_with_limit m, %r(UInt128), Type::UnsignedInteger #not implemnted in clickhouse
         register_class_with_limit m, %r(UInt256), Type::UnsignedInteger
+        # register_class_with_limit m, %r(Array), Clickhouse::OID::Array
+        m.register_type(%r(Array)) do |sql_type|
+          Clickhouse::OID::Array.new(sql_type)
+        end
       end
 
       # Quoting time without microseconds
@@ -253,7 +266,7 @@ module ActiveRecord
       def create_view(table_name, **options)
         options.merge!(view: true)
         options = apply_replica(table_name, options)
-        td = create_table_definition(apply_cluster(table_name), options)
+        td = create_table_definition(apply_cluster(table_name), **options)
         yield td if block_given?
 
         if options[:force]
@@ -263,16 +276,29 @@ module ActiveRecord
         execute schema_creation.accept td
       end
 
-      def create_table(table_name, **options)
+      def create_table(table_name, **options, &block)
         options = apply_replica(table_name, options)
-        td = create_table_definition(apply_cluster(table_name), options)
-        yield td if block_given?
+        td = create_table_definition(apply_cluster(table_name), **options)
+        block.call td if block_given?
 
         if options[:force]
           drop_table(table_name, options.merge(if_exists: true))
         end
 
         execute schema_creation.accept td
+      end
+
+      def create_table_with_distributed(table_name, **options, &block)
+        sharding_key = options.delete(:sharding_key) || 'rand()'
+        create_table("#{table_name}_distributed", **options, &block)
+        raise 'Set a cluster' unless cluster
+
+        distributed_options = "Distributed(#{cluster},#{@config[:database]},#{table_name}_distributed,#{sharding_key})"
+        create_table(table_name, **options.merge(options: distributed_options), &block)
+      end
+
+      def drop_table_with_distributed(table_name, **options)
+        ["#{table_name}_distributed", table_name].each { |name| drop_table(name, **options) }
       end
 
       # Drops a ClickHouse database.
@@ -315,12 +341,39 @@ module ActiveRecord
         @full_config[:replica_name]
       end
 
+      def use_default_replicated_merge_tree_params?
+        database_engine_atomic? && @full_config[:use_default_replicated_merge_tree_params]
+      end
+
+      def use_replica?
+        (replica || use_default_replicated_merge_tree_params?) && cluster
+      end
+
       def replica_path(table)
         "/clickhouse/tables/#{cluster}/#{@config[:database]}.#{table}"
       end
 
+      def database_engine_atomic?
+        current_database_engine = "select engine from system.databases where name = '#{@config[:database]}'"
+        res = ActiveRecord::Base.connection.select_one(current_database_engine)
+        res['engine'] == 'Atomic' if res
+      end
+
       def apply_cluster(sql)
         cluster ? "#{sql} ON CLUSTER #{cluster}" : sql
+      end
+
+      def supports_insert_on_duplicate_skip?
+        true
+      end
+
+      def supports_insert_on_duplicate_update?
+        true
+      end
+
+      def build_insert_sql(insert) # :nodoc:
+        sql = +"INSERT #{insert.into} #{insert.values_list}"
+        sql
       end
 
       protected
@@ -339,16 +392,34 @@ module ActiveRecord
 
       def connect
         @connection = @connection_parameters[:connection] || Net::HTTP.start(@connection_parameters[:host], @connection_parameters[:port], use_ssl: @connection_parameters[:ssl], verify_mode: OpenSSL::SSL::VERIFY_NONE)
+
+        @connection.ca_file = @connection_parameters[:ca_file] if @connection_parameters[:ca_file]
+        @connection.read_timeout = @connection_parameters[:read_timeout] if @connection_parameters[:read_timeout]
+        @connection.write_timeout = @connection_parameters[:write_timeout] if @connection_parameters[:write_timeout]
+
+        @connection
       end
 
       def apply_replica(table, options)
-        if replica && cluster && options[:options]
-          match = options[:options].match(/^(.*?MergeTree)\(([^\)]*)\)(.*?)$/)
-          if match
-            options[:options] = "Replicated#{match[1]}(#{([replica_path(table), replica].map{|v| "'#{v}'"} + [match[2].presence]).compact.join(', ')})#{match[3]}"
+        if use_replica? && options[:options]
+          if options[:options].match(/^Replicated/)
+            raise 'Do not try create Replicated table. It will be configured based on the *MergeTree engine.'
           end
+
+          options[:options] = configure_replica(table, options[:options])
         end
         options
+      end
+
+      def configure_replica(table, options)
+        match = options.match(/^(.*?MergeTree)(?:\(([^\)]*)\))?((?:.|\n)*)/)
+        return options unless match
+
+        if replica
+          engine_params = ([replica_path(table), replica].map { |v| "'#{v}'" } + [match[2].presence]).compact.join(', ')
+        end
+
+        "Replicated#{match[1]}(#{engine_params})#{match[3]}"
       end
     end
   end
